@@ -456,6 +456,21 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.pixel {
+            // Manual per-vertex reads declare the input constant. DXIL requires
+            // unused floats packed into that register to agree with the read.
+            let constant_rows: std::collections::HashSet<_> = self.inputs.iter()
+                .filter(|e| e.usage != 0 && e.interp == 1)
+                .filter_map(|e| e.row)
+                .collect();
+            for e in &mut self.inputs {
+                if e.kind == 0 && e.comp == 9 && e.usage == 0
+                    && e.row.is_some_and(|row| constant_rows.contains(&row))
+                {
+                    e.interp = 1;
+                }
+            }
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
