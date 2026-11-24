@@ -5620,6 +5620,10 @@ struct Meter {
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
+    frame_drawn: u64,
+    frame_counts: [u64; 4],
+    frame_carry: [u64; 2],
+    frame_lines: u8,
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
@@ -5634,6 +5638,15 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
+            frame_drawn: crate::draw::drawn(),
+            frame_counts: [
+                crate::draw::DROPPED.load(Ordering::Relaxed),
+                crate::list::INDIRECT.load(Ordering::Relaxed),
+                crate::resource::PLANES[1].load(Ordering::Relaxed),
+                crate::resource::PLANES[2].load(Ordering::Relaxed),
+            ],
+            frame_carry: [0; 2],
+            frame_lines: 0,
             logged: now,
             caption: None,
         }
@@ -5645,6 +5658,37 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        if self.frame_lines < 8 {
+            let drawn = crate::draw::drawn();
+            let draws = drawn.saturating_sub(self.frame_drawn);
+            let counts = [
+                crate::draw::DROPPED.load(Ordering::Relaxed),
+                crate::list::INDIRECT.load(Ordering::Relaxed),
+                crate::resource::PLANES[1].load(Ordering::Relaxed),
+                crate::resource::PLANES[2].load(Ordering::Relaxed),
+            ];
+            let mut delta = [0; 4];
+            for i in 0..4 {
+                delta[i] = counts[i].saturating_sub(self.frame_counts[i]);
+            }
+            for i in 0..2 {
+                delta[i] += self.frame_carry[i];
+                self.frame_carry[i] = 0;
+            }
+            (self.frame_drawn, self.frame_counts) = (drawn, counts);
+            if draws > 100 {
+                self.frame_lines += 1;
+                tracing::info!(
+                    "frame={} draws={draws} no_host_pipeline={} pipeline_making={} indirect_dropped={} depth_not_returned={} depth_used_before_pass={} presented=unknown",
+                    crate::frame::current(),
+                    delta[0],
+                    crate::pipeline::making(),
+                    delta[1],
+                    delta[2],
+                    delta[3]
+                );
+            }
+        }
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -5661,18 +5705,24 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
+        let [cpu, gpu] =
+            [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
-        let dropped = crate::draw::take_dropped() as f64 / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
+        let [back_ms, back_mb] =
+            [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
+        let dropped_count = crate::draw::take_dropped();
+        let indirect_count = crate::list::take_indirect();
+        if self.frame_lines < 8 {
+            for (i, taken) in [dropped_count, indirect_count].into_iter().enumerate() {
+                self.frame_carry[i] += taken.saturating_sub(self.frame_counts[i]);
+                self.frame_counts[i] = self.frame_counts[i].saturating_sub(taken);
+            }
+        }
+        let dropped = dropped_count as f64 / frames;
+        let indirect = indirect_count as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(

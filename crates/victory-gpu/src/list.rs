@@ -1737,7 +1737,7 @@ extern "system" fn execute_indirect(
 pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
-static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
