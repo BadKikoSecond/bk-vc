@@ -6437,6 +6437,46 @@ impl<'a> Lower<'a> {
                     _ => Err("a typed root view"),
                 }
             }
+            Source::Phi { block, args } if sampler && self.is_sampler_range(*block, args) => {
+                let mut words = Vec::with_capacity(args.len());
+                for a in args {
+                    let Source::Constant(w) = a else {
+                        return Err("a descriptor chosen by control flow");
+                    };
+                    let w: [u32; 4] = w
+                        .get(..4)
+                        .and_then(|w| w.try_into().ok())
+                        .ok_or("a sampler constant")?;
+                    words.push(w);
+                }
+                let preds = &self.x.p.blocks[*block].preds;
+                if preds.len() != args.len() {
+                    return Err("a descriptor chosen by control flow");
+                }
+                // Register the whole range now so its slots are consecutive,
+                // whatever immediate samplers the program used before.
+                let lo = self.samplers.len() as u32;
+                for w in words {
+                    self.samplers.push(w);
+                }
+                let hi = self.samplers.len() as u32 - 1;
+                if props.0 & 0x8000 != 0 {
+                    for n in lo..=hi {
+                        if n < 64 {
+                            self.s.cmp_samplers |= 1 << n;
+                        }
+                    }
+                }
+                let mut index = self.s.m.i32(lo);
+                for (k, &pred) in preds.iter().enumerate().skip(1) {
+                    let cond = self.boolean(self.x.st.reach[pred], *block)?;
+                    let n = self.s.m.i32(lo + k as u32);
+                    index = self.s.m.select(self.cur, cond, n, index);
+                }
+                Ok(self
+                    .s
+                    .sampler_range_handle(self.cur, lo, hi, index))
+            }
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
@@ -6509,6 +6549,18 @@ impl<'a> Lower<'a> {
         let phi = self.s.m.phi(join, self.s.t.i32);
         self.s.m.set_phi(phi, incoming);
         Ok(phi)
+    }
+
+    /// Whether a sampler phi is the small, direct constant range that can be
+    /// selected with one static-sampler binding rather than branch dispatch.
+    /// Pixel stages keep the branch dispatch: their range index is per lane.
+    fn is_sampler_range(&self, block: usize, args: &[Source]) -> bool {
+        !self.s.pixel
+            && (2..=3).contains(&args.len())
+            && self.x.p.blocks[block].preds.len() == args.len()
+            && args
+                .iter()
+                .all(|a| matches!(a, Source::Constant(w) if w.len() >= 4))
     }
 
     /// Registers an immediate sampler constant and returns its slot index.
@@ -10053,6 +10105,9 @@ impl<'a> Lower<'a> {
             }
             let mut sampler_choice: Option<(V, Vec<u32>)> = None;
             let sh = match ss {
+                Source::Phi { block, args } if self.is_sampler_range(*block, args) => {
+                    self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?
+                }
                 Source::Phi { block, args } => {
                     match self.sampler_phi_choice(*block, args, cmp, 8) {
                         Ok((None, regs)) => self.s.sampler_handle(self.cur, regs[0]),

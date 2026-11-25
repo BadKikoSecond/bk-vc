@@ -374,6 +374,11 @@ fn immediate_sampler_chosen_by_control_flow() {
         })
         .unwrap_or_else(|e| panic!("{case_name}: lower failed: {e}"));
 
+        // A choice of distinct descriptors registers one consecutive range;
+        // identical descriptors collapse to the existing single sampler.
+        let want = if alt == samp_a { 1 } else { 2 };
+        assert_eq!(lowered.samplers.len(), want, "{case_name}");
+
         let static_samplers = lowered
             .samplers
             .iter()
