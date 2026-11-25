@@ -8,6 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::resource::RootIndexedView;
@@ -357,6 +358,30 @@ fn dropped(pipeline: usize) {
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
+}
+
+thread_local! {
+    /// Why the command being prepared on this thread took a non-executed
+    /// branch. Kept only while the full graphics log may retain the frame.
+    static NOT_RUN: RefCell<Option<crate::frame_log::Issue>> = const { RefCell::new(None) };
+}
+
+/// Starts one title graphics command's observational context.
+pub(crate) fn begin_command() {
+    if crate::frame_log::candidate() {
+        NOT_RUN.with(|why| *why.borrow_mut() = None);
+        crate::frame_log::begin_texture_scan();
+    }
+}
+
+fn not_run(make: impl FnOnce() -> crate::frame_log::Issue) {
+    if crate::frame_log::candidate() {
+        NOT_RUN.with(|why| *why.borrow_mut() = Some(make()));
+    }
+}
+
+fn take_not_run() -> Option<crate::frame_log::Issue> {
+    NOT_RUN.with(|why| why.borrow_mut().take())
 }
 
 /// Dispatches run on the host so far.
@@ -755,13 +780,21 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            not_run(|| crate::frame_log::Issue::skipped("pipeline skipped"));
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            not_run(|| crate::pipeline::host_issue(self.pipeline as This));
             return false;
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            not_run(|| {
+                crate::frame_log::Issue::skipped(format!(
+                    "pipeline kind mismatch: compute {}, mesh {}, requested mesh {}",
+                    p.compute, p.mesh, mesh
+                ))
+            });
             return false;
         }
         if p.rects && self.topology != RECTANGLES {
@@ -802,6 +835,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                not_run(|| crate::frame_log::Issue::missing("index buffer outside title buffers"));
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -903,6 +937,11 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                not_run(|| {
+                    crate::frame_log::Issue::missing(
+                        "bind failed: no free dynamic descriptor slots",
+                    )
+                });
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -913,6 +952,11 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                    not_run(|| {
+                        crate::frame_log::Issue::missing(
+                            "bind failed: title-memory view heap or directory unavailable",
+                        )
+                    });
                     return false;
                 };
                 Some(ready)
@@ -1104,6 +1148,11 @@ impl State {
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
+                not_run(|| {
+                    crate::frame_log::Issue::missing(
+                        "bind failed: root UAV has no writable host buffer",
+                    )
+                });
                 return false;
             };
             ready(a, &s);
@@ -1127,6 +1176,11 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root UAV without a bound view heap: the draw is dropped");
+            not_run(|| {
+                crate::frame_log::Issue::missing(
+                    "bind failed: root UAV has no bound host view heap",
+                )
+            });
             return false;
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
@@ -1135,6 +1189,11 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
+                    not_run(|| {
+                        crate::frame_log::Issue::missing(
+                            "bind failed: no free dynamic descriptor slot for root UAV",
+                        )
+                    });
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -1152,6 +1211,7 @@ impl State {
                 }
                 if shadow.is_none() {
                     host.null_raw_uav_at(index);
+                    crate::frame_log::note_texture(index, crate::frame_log::TextureState::Null);
                 }
                 self.root_uav_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
@@ -1193,6 +1253,11 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root SRV without a bound view heap: the draw is dropped");
+            not_run(|| {
+                crate::frame_log::Issue::missing(
+                    "bind failed: root SRV has no bound host view heap",
+                )
+            });
             return false;
         };
         // A view that begins early is another view than one that does not
@@ -1206,6 +1271,11 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
+                    not_run(|| {
+                        crate::frame_log::Issue::missing(
+                            "bind failed: no free dynamic descriptor slot for root SRV",
+                        )
+                    });
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -1231,9 +1301,16 @@ impl State {
                                 "a root SRV not on 16 bytes reads zeros"
                             );
                             host.null_raw_at(index);
+                            crate::frame_log::note_texture(
+                                index,
+                                crate::frame_log::TextureState::Null,
+                            );
                         }
                     }
-                    None => host.null_raw_at(index),
+                    None => {
+                        host.null_raw_at(index);
+                        crate::frame_log::note_texture(index, crate::frame_log::TextureState::Null);
+                    }
                 }
                 (index, shadow)
             }
@@ -1665,18 +1742,29 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        begin_command();
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            not_run(|| crate::frame_log::Issue::skipped("pipeline skipped"));
             self.frame_log("dispatch", Some("pipeline skipped"));
+            self.log_gfx(
+                "dispatch",
+                crate::frame_log::Issue::skipped("pipeline skipped"),
+            );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            not_run(|| crate::frame_log::Issue::skipped("ray-tracing structure builder disabled"));
             self.frame_log("dispatch", Some("builder disabled"));
+            self.log_gfx(
+                "dispatch",
+                crate::frame_log::Issue::skipped("ray-tracing structure builder disabled"),
+            );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
@@ -1686,7 +1774,12 @@ impl State {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            not_run(|| crate::pipeline::host_issue(self.pipeline as This));
             self.frame_log("dispatch", Some("no host pipeline"));
+            self.log_gfx(
+                "dispatch",
+                crate::frame_log::Issue::skipped("no host pipeline"),
+            );
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -1700,12 +1793,18 @@ impl State {
             return;
         };
         if !p.compute {
+            not_run(|| crate::frame_log::Issue::skipped("dispatch bound to a graphics pipeline"));
             self.frame_log("dispatch", Some("graphics pipeline"));
+            self.log_gfx(
+                "dispatch",
+                crate::frame_log::Issue::skipped("dispatch bound to a graphics pipeline"),
+            );
             once!("a dispatch with a graphics pipeline");
             return;
         }
         if !self.bind(list, p, true) {
             self.frame_log("dispatch", Some("bind failed"));
+            self.log_gfx("dispatch", crate::frame_log::Issue::skipped("bind failed"));
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -1719,6 +1818,7 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.frame_log("dispatch", None);
+        self.log_gfx("dispatch", crate::frame_log::Issue::executed());
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1805,13 +1905,25 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        begin_command();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = mesh_test() != 1
-            && mesh_kept(self.pipeline)
-            && self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
+        let failure = if mesh_test() == 1 {
+            Some(crate::frame_log::Issue::skipped(
+                "mesh path disabled (VICTORY_MESH_TEST=skip)",
+            ))
+        } else if !mesh_kept(self.pipeline) {
+            Some(crate::frame_log::Issue::skipped(
+                "mesh shader excluded by VICTORY_MESH_TEST=keep",
+            ))
+        } else if !self.prepare_for(list, false, true) {
+            Some(
+                take_not_run()
+                    .unwrap_or_else(|| crate::frame_log::Issue::skipped("mesh prepare failed")),
+            )
+        } else {
+            match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
@@ -1820,16 +1932,24 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
-                    true
+                    None
                 }
-                Err(_) => false,
+                Err(_) => Some(crate::frame_log::Issue::missing(
+                    "host ID3D12GraphicsCommandList6 interface unavailable",
+                )),
+            }
             };
+        let ran = failure.is_none();
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
         self.frame_log("dispatch", if ran { None } else { Some("mesh disabled, prepare failed, or host interface unavailable") });
+        self.gfx_log(
+            "mesh",
+            failure.unwrap_or_else(crate::frame_log::Issue::executed),
+        );
     }
 
     pub(crate) fn frame_log(&self, kind: &str, reason: Option<&str>) {
@@ -1841,12 +1961,103 @@ impl State {
         });
     }
 
+    /// One full-log line for a title graphics command. The lazy closure is
+    /// not run when either logging mode is off or the new log is finished.
+    pub(crate) fn gfx_log(&self, kind: &str, issue: crate::frame_log::Issue) {
+        crate::frame_log::record_command(|| {
+            let shaders = crate::pipeline::shader_fields(self.pipeline as This);
+            let targets: Vec<String> = self
+                .targets
+                .iter()
+                .filter(|&&t| t != 0)
+                .map(|t| format!("{t:#x}"))
+                .collect();
+            let texture = crate::frame_log::take_texture();
+            format!(
+                "kind={kind}{shaders} status={} reason={} targets={targets:?} depth={:#x} pass=untagged {texture}",
+                issue.status, issue.reason, self.depth
+            )
+        });
+    }
+
+    fn log_gfx(&self, kind: &str, fallback: crate::frame_log::Issue) {
+        self.gfx_log(kind, take_not_run().unwrap_or(fallback));
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
         } else {
             &self.graphics
         }
+    }
+
+    /// What a bound view says about its texture/resource at this command.
+    /// This only observes state the bind path already knows; it never makes
+    /// a host resource or starts an upload.
+    fn texture_state(view: &View) -> Option<crate::frame_log::TextureState> {
+        use crate::frame_log::TextureState;
+        const BUFFER: u32 = 1;
+        match view {
+            View::Placed(false, resource, desc) if resource[0] != BUFFER => {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let Some(len) = crate::resource::placed_bytes(resource) else {
+                    return Some(TextureState::Unknown);
+                };
+                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                Some(if mapped == 0 {
+                    TextureState::Unmapped
+                } else if mapped < len {
+                    TextureState::Waiting
+                } else {
+                    TextureState::Ready
+                })
+            }
+            View::Placed(true, resource, _) if resource[0] != BUFFER => {
+                // The host deliberately does not mirror placed texture UAVs.
+                Some(TextureState::Null)
+            }
+            View::Shader(resource, _) | View::Unordered(resource, _, _) => {
+                if crate::resource::buffer_bytes(*resource as This).is_some() {
+                    return Some(if crate::descriptor::host::buffer_copy(view).is_some() {
+                        TextureState::Ready
+                    } else {
+                        TextureState::Null
+                    });
+                }
+                let Some(texture) = crate::resource::host_resource(*resource as This) else {
+                    return Some(TextureState::Waiting);
+                };
+                let waiting = crate::texture::title_written(texture)
+                    && crate::texture::staged(*resource as This).is_some_and(|(_, whole)| !whole);
+                Some(if waiting {
+                    TextureState::Waiting
+                } else {
+                    TextureState::Ready
+                })
+            }
+            View::Placed(_, resource, _) if resource[0] == BUFFER => {
+                Some(if crate::descriptor::host::buffer_copy(view).is_some() {
+                    TextureState::Ready
+                } else {
+                    TextureState::Null
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn note_view_slot(&self, host: &crate::descriptor::host::HostHeap, index: u32, view: &View) {
+        if !crate::frame_log::candidate() {
+            return;
+        }
+        let Some(mut state) = Self::texture_state(view) else {
+            return;
+        };
+        if state == crate::frame_log::TextureState::Ready && host.slot_null(index) == Some(true) {
+            state = crate::frame_log::TextureState::Null;
+        }
+        crate::frame_log::note_texture(index, state);
     }
 
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
@@ -1860,12 +2071,16 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        match host.mirror(index, handle, true) {
+            Some(view) => {
+                self.note_view_slot(host, index, &view);
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
             }
+        }
+            None => crate::frame_log::note_texture(index, crate::frame_log::TextureState::Null),
         }
     }
 
@@ -1986,6 +2201,12 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
+                        if crate::frame_log::candidate()
+                            && let Some(index) = heap.index(handle)
+                            && let Some(host) = heap.host()
+                        {
+                            self.note_view_slot(host, index, &view);
+                        }
                         readable(list, u.kind, &view);
                     }
                 }
@@ -1997,6 +2218,12 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
+                        if crate::frame_log::candidate()
+                            && let Some(index) = heap.index(handle)
+                            && let Some(host) = heap.host()
+                        {
+                            self.note_view_slot(host, index, &view);
+                        }
                         readable(list, kind, &view);
                     }
                 }
@@ -2024,12 +2251,21 @@ impl State {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
+                            crate::frame_log::note_texture(
+                                index,
+                                crate::frame_log::TextureState::Null,
+                            );
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
+                        if crate::frame_log::candidate()
+                            && let Some(state) = Self::texture_state(&view)
+                        {
+                            crate::frame_log::note_texture(index, state);
+                        }
                         host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
@@ -2053,6 +2289,7 @@ impl State {
                     }
                     None => {
                         host.make_null(index);
+                        crate::frame_log::note_texture(index, crate::frame_log::TextureState::Null);
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
@@ -2138,6 +2375,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        begin_command();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -2168,6 +2406,16 @@ impl State {
             dropped(self.pipeline);
         }
         self.frame_log("draw", if ran { None } else if !ready { Some("prepare failed") } else { Some("rectangle expansion failed") });
+        self.log_gfx(
+            "draw",
+            if ran {
+                crate::frame_log::Issue::executed()
+            } else if !ready {
+                crate::frame_log::Issue::skipped("prepare failed")
+            } else {
+                crate::frame_log::Issue::skipped("rectangle expansion failed")
+            },
+        );
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
@@ -2202,9 +2450,19 @@ impl State {
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
+                not_run(|| {
+                    crate::frame_log::Issue::missing(format!(
+                        "rectangle vertices outside their buffer (slot {slot})"
+                    ))
+                });
                 return false;
             }
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+                not_run(|| {
+                    crate::frame_log::Issue::missing(format!(
+                        "rectangle scratch allocation failed (slot {slot})"
+                    ))
+                });
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
@@ -2244,6 +2502,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        begin_command();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -2270,6 +2529,16 @@ impl State {
             dropped(self.pipeline);
         }
         self.frame_log("draw", if ran { None } else if lost { Some("indexed rectangles unsupported") } else { Some("prepare failed") });
+        self.log_gfx(
+            "indexed",
+            if ran {
+                crate::frame_log::Issue::executed()
+            } else if lost {
+                crate::frame_log::Issue::skipped("indexed rectangles unsupported")
+            } else {
+                crate::frame_log::Issue::skipped("prepare failed")
+            },
+        );
     }
 }
 
@@ -2287,15 +2556,26 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        begin_command();
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
+            not_run(|| crate::frame_log::Issue::skipped("pipeline skipped"));
             self.frame_log("indirect", Some("pipeline skipped"));
+            self.log_gfx(
+                "execute_indirect",
+                crate::frame_log::Issue::skipped("pipeline skipped"),
+            );
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            not_run(|| crate::frame_log::Issue::skipped("ray-tracing structure builder disabled"));
             self.frame_log("indirect", Some("builder disabled"));
+            self.log_gfx(
+                "execute_indirect",
+                crate::frame_log::Issue::skipped("ray-tracing structure builder disabled"),
+            );
             return false;
         }
         const DRAW: u32 = 0;
@@ -2309,7 +2589,12 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            not_run(|| crate::pipeline::host_issue(self.pipeline as This));
             self.frame_log("indirect", Some("no host pipeline"));
+            self.log_gfx(
+                "execute_indirect",
+                crate::frame_log::Issue::skipped("no host pipeline"),
+            );
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256
@@ -2327,6 +2612,18 @@ impl State {
         if made_rects {
             once!("indirect rectangles without vertex inputs drawn as their first triangle");
         }
+        if !matches!(kind, DRAW | INDEXED | DISPATCH | MESH) {
+            why(&format!("unsupported indirect kind {kind}"));
+            not_run(|| {
+                crate::frame_log::Issue::skipped(format!("unsupported indirect kind {kind}"))
+            });
+            self.frame_log("indirect", Some("pipeline mismatch"));
+            self.log_gfx(
+                "execute_indirect",
+                crate::frame_log::Issue::skipped(format!("unsupported indirect kind {kind}")),
+            );
+            return false;
+        }
         let matches_kind = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || made_rects || p.rects) && !p.compute && !p.mesh
@@ -2340,13 +2637,30 @@ impl State {
                 "pipeline mismatch (compute {}, mesh {}, topology {})",
                 p.compute, p.mesh, self.topology
             ));
+            not_run(|| {
+                crate::frame_log::Issue::skipped(format!(
+                    "indirect kind {kind} pipeline mismatch: compute {}, mesh {}, topology {}",
+                    p.compute, p.mesh, self.topology
+                ))
+            });
             self.frame_log("indirect", Some("pipeline mismatch"));
+            self.log_gfx(
+                "execute_indirect",
+                crate::frame_log::Issue::skipped("pipeline mismatch"),
+            );
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
+            not_run(|| {
+                crate::frame_log::Issue::missing("indirect arguments outside title buffers")
+            });
             self.frame_log("indirect", Some("arguments outside title buffers"));
+            self.log_gfx(
+                "execute_indirect",
+                crate::frame_log::Issue::missing("indirect arguments outside title buffers"),
+            );
             return false;
         };
         let counter = match count {
@@ -2354,24 +2668,52 @@ impl State {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
+                    not_run(|| {
+                        crate::frame_log::Issue::missing(
+                            "indirect count buffer outside title buffers",
+                        )
+                    });
                     self.frame_log("indirect", Some("count outside title buffers"));
+                    self.log_gfx(
+                        "execute_indirect",
+                        crate::frame_log::Issue::missing(
+                            "indirect count buffer outside title buffers",
+                        ),
+                    );
                     return false;
                 }
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
-            why("no host signature");
+        let signature = match host_signature(kind, stride) {
+            Ok(signature) => signature,
+            Err(issue) => {
+                why("host command signature unavailable");
+                let issue = issue.issue();
+                not_run(|| issue);
             self.frame_log("indirect", Some("no host signature"));
+                self.log_gfx(
+                    "execute_indirect",
+                    crate::frame_log::Issue::skipped("no host signature"),
+                );
             return false;
+            }
         };
-        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+        if kind == MESH {
+            let reason = if mesh_test() == 1 {
+                Some("mesh path disabled (VICTORY_MESH_TEST=skip)")
+            } else if !mesh_kept(self.pipeline) {
+                Some("mesh shader excluded by VICTORY_MESH_TEST=keep")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
+                not_run(|| crate::frame_log::Issue::skipped(reason));
             self.frame_log("indirect", Some("mesh disabled"));
+                self.log_gfx("execute_indirect", crate::frame_log::Issue::skipped(reason));
             return false;
+        }
         }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
@@ -2431,15 +2773,33 @@ impl State {
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead_with_issue(
+                        list,
+                        (&args.buffer, offset),
+                        (kind, step, records),
+                    )
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound_with_issue(
+                        list,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, step, records),
+                    )
                 };
-                let Some(bounded) = bounded else {
+                let bounded = match bounded {
+                    Ok(bounded) => bounded,
+                    Err(issue) => {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        let issue = indirect_bound_issue(&issue);
+                        not_run(|| issue);
                     self.frame_log("indirect", Some("not bounded"));
+                        self.log_gfx(
+                            "execute_indirect",
+                            crate::frame_log::Issue::skipped("not bounded"),
+                        );
                     return false;
+                    }
                 };
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
@@ -2465,6 +2825,10 @@ impl State {
             crate::indirect::done(list, &bounded);
             why("prepare failed");
             self.frame_log("indirect", Some("prepare failed"));
+            self.log_gfx(
+                "execute_indirect",
+                crate::frame_log::Issue::skipped("prepare failed"),
+            );
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -2491,6 +2855,7 @@ impl State {
         }
         crate::indirect::done(list, &bounded);
         self.frame_log("indirect", None);
+        self.log_gfx("execute_indirect", crate::frame_log::Issue::executed());
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -2500,15 +2865,53 @@ impl State {
     }
 }
 
+fn indirect_bound_issue(issue: &crate::indirect::BoundIssue) -> crate::frame_log::Issue {
+    use crate::frame_log::Issue;
+    use crate::indirect::BoundIssue;
+    let reason = issue.reason();
+    match issue {
+        BoundIssue::Clamp => Issue::refused(reason),
+        BoundIssue::Budget | BoundIssue::Scratch => Issue::missing(reason),
+        BoundIssue::UnsupportedKind(_)
+        | BoundIssue::Stride { .. }
+        | BoundIssue::SourceOffset(_)
+        | BoundIssue::CountOffset(_)
+        | BoundIssue::Size
+        | BoundIssue::RecordAddress => Issue::skipped(reason),
+    }
+}
+
+enum SignatureIssue {
+    NoHost,
+    Refused(windows::core::Error),
+    Null,
+}
+
+impl SignatureIssue {
+    fn issue(&self) -> crate::frame_log::Issue {
+        match self {
+            Self::NoHost => crate::frame_log::Issue::missing(
+                "host command signature unavailable: no host device",
+            ),
+            Self::Refused(error) => {
+                crate::frame_log::Issue::refused(format!("host command signature refused: {error}"))
+            }
+            Self::Null => {
+                crate::frame_log::Issue::missing("host command signature creation returned null")
+            }
+        }
+    }
+}
+
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+fn host_signature(kind: u32, stride: u32) -> Result<ID3D12CommandSignature, SignatureIssue> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
+        return Ok(s.clone());
     }
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
@@ -2521,9 +2924,12 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
         NodeMask: 0,
     };
     let mut signature: Option<ID3D12CommandSignature> = None;
+    let Some(host) = crate::host::host() else {
+        return Err(SignatureIssue::NoHost);
+    };
     // SAFETY: a description of one argument; no root arguments.
     let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
+        host.device.CreateCommandSignature(
             &desc,
             None::<&ID3D12RootSignature>,
             &mut signature,
@@ -2531,11 +2937,11 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     };
     if let Err(e) = result {
         once!(error = %e, kind, stride, "host command signature refused");
-        return None;
+        return Err(SignatureIssue::Refused(e));
     }
-    let signature = signature?;
+    let signature = signature.ok_or(SignatureIssue::Null)?;
     made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    Ok(signature)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data

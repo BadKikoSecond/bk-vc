@@ -311,7 +311,12 @@ pub(crate) struct HostPipeline {
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+fn refuse(
+    reason: &'static str,
+    shaders: &[Arc<Shader>],
+    g: Option<&GraphicsState>,
+) -> Option<HostPipeline> {
+    super::note_refusal(shaders, g.map(GraphicsState::describe), reason.to_owned());
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
@@ -341,6 +346,7 @@ impl HostPipeline {
             return refuse(
                 "only vertex, mesh, pixel and compute stages are translated",
                 shaders,
+                g,
             );
         }
         let mesh = find("mesh");
@@ -350,19 +356,29 @@ impl HostPipeline {
             let first = match (mesh, find("vertex")) {
                 (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
                 (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
-                (None, None) => return refuse("no vertex or mesh shader", shaders),
+                (None, None) => return refuse("no vertex or mesh shader", shaders, g),
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+        if mesh.is_some() && !host().is_some_and(|host| host.mesh_shaders()) {
+            return refuse(
+                "no host device or the host GPU has no mesh shaders (or no shader model 6.6)",
+                shaders,
+                g,
+            );
         }
         for (s, _) in &stages {
             s.translated()?;
         }
-        let host = host()?;
+        let host = match host() {
+            Some(host) => host,
+            None => {
+                super::note_refusal(shaders, g.map(GraphicsState::describe), "no host device".to_owned());
+                return None;
+            }
+        };
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -492,6 +508,7 @@ impl HostPipeline {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                super::note_refusal(shaders, g.map(GraphicsState::describe), format!("host root signature refused: {e}"));
                 return None;
             }
         };
@@ -524,6 +541,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
+                    super::note_refusal(shaders, g.map(GraphicsState::describe), format!("host compute pipeline refused: {e}"));
                     return None;
                 }
             };
@@ -543,7 +561,7 @@ impl HostPipeline {
             });
         }
         let Some(g) = g else {
-            return refuse("graphics state not kept (plain description)", shaders);
+            return refuse("graphics state not kept (plain description)", shaders, g);
         };
         let state = g.describe();
         if mesh.is_some() {
@@ -562,6 +580,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
+                    super::note_refusal(shaders, Some(g.describe()), format!("host mesh pipeline refused: {e}"));
                     return None;
                 }
             };
@@ -665,6 +684,7 @@ impl HostPipeline {
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
+                super::note_refusal(shaders, Some(g.describe()), format!("host graphics pipeline refused: {e}"));
                 return None;
             }
         };

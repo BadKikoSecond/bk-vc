@@ -1611,8 +1611,16 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
+            crate::draw::begin_command();
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            #[cfg(windows)]
+            with_state(this, |_, s| {
+                s.gfx_log(
+                    "mesh",
+                    crate::frame_log::Issue::skipped("indirect DispatchMeshX is not implemented"),
+                )
+            });
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1690,26 +1698,44 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    crate::draw::begin_command();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         #[cfg(windows)]
-        with_state(this, |_, s| s.frame_log("indirect", Some("unknown signature")));
+        with_state(this, |_, s| {
+            s.frame_log("indirect", Some("unknown signature"));
+            s.gfx_log(
+                "execute_indirect",
+                crate::frame_log::Issue::missing("indirect signature layout unknown"),
+            )
+        });
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
-        && (count.is_null() || counter.is_some())
-    {
+    if args.len() == 1 && address.is_some() && (count.is_null() || counter.is_some()) {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let kind = if args[0][0] == DISPATCH_SINGLE { DISPATCH } else { args[0][0] };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, max), address.unwrap_or(0), counter);
         });
     } else {
-        with_state(this, |_, s| s.frame_log("indirect", Some("unsupported signature or invalid argument buffer")));
+        #[cfg(windows)]
+        with_state(this, |_, s| {
+            s.frame_log("indirect", Some("unsupported signature or invalid argument buffer"));
+            let issue = if args.len() != 1 {
+                crate::frame_log::Issue::skipped(
+                    "indirect signature must contain exactly one argument",
+                )
+            } else if address.is_none() {
+                crate::frame_log::Issue::missing("indirect argument resource is not a buffer")
+            } else {
+                crate::frame_log::Issue::missing("indirect count resource is not a buffer")
+            };
+            s.gfx_log("execute_indirect", issue);
+        });
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",

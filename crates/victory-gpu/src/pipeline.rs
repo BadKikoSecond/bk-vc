@@ -374,6 +374,60 @@ pub(crate) fn shader_hashes(this: This) -> String {
     if hashes.is_empty() { "none".to_owned() } else { hashes.join(",") }
 }
 
+/// The stage-labelled hashes the full graphics log writes. Only stages the
+/// host can execute are named; the older log above keeps its own format.
+#[cfg(windows)]
+pub(crate) fn shader_fields(this: This) -> String {
+    if this.is_null() {
+        return String::new();
+    }
+    let mut fields = String::new();
+    for shader in &pipeline(this).shaders {
+        let stage = match shader.stage {
+            "vertex" => "vs",
+            "pixel" => "ps",
+            "mesh" => "ms",
+            "compute" => "cs",
+            _ => continue,
+        };
+        fields.push(' ');
+        fields.push_str(stage);
+        fields.push('=');
+        fields.push_str(&shader.hash);
+    }
+    fields
+}
+
+#[cfg(windows)]
+static REFUSALS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// Records why a host pipeline was refused, for a command that later asks
+/// for its exact status. One short string per refused shader combination.
+#[cfg(windows)]
+pub(crate) fn note_refusal(
+    shaders: &[Arc<Shader>],
+    state: Option<String>,
+    reason: String,
+) {
+    let key = format!("{shaders:?} {state:?}");
+    REFUSALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_insert(reason);
+}
+
+#[cfg(windows)]
+fn refusal(shaders: &[Arc<Shader>], state: Option<&str>) -> Option<String> {
+    REFUSALS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()?
+        .get(&format!("{shaders:?} {state:?}"))
+        .cloned()
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
@@ -399,6 +453,44 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// The exact branch behind a failed `host_pipeline` lookup. This is read
+/// after the real lookup, so it never starts or waits for compilation.
+#[cfg(windows)]
+pub(crate) fn host_issue(this: This) -> crate::frame_log::Issue {
+    use crate::frame_log::Issue;
+    if !crate::frame_log::candidate() {
+        return Issue::skipped("no host pipeline");
+    }
+    if this.is_null() {
+        return Issue::missing("no pipeline set");
+    }
+    let p = pipeline(this);
+    match make::made(&p.host) {
+        // A worker may finish between the failed lookup and this question;
+        // the command still took the not-ready branch above.
+        None | Some(true) => {
+            Issue::making("host pipeline was still being made when the command checked it")
+        }
+        Some(false) => {
+            let failed: Vec<String> = p
+                .shaders
+                .iter()
+                .filter(|shader| matches!(shader.translated.get(), Some(None)))
+                .map(|shader| format!("{} {}", shader.stage, shader.hash))
+                .collect();
+            if failed.is_empty() {
+                let state = p.host.graphics.as_deref().map(|g| g.describe());
+                Issue::refused(
+                    refusal(&p.shaders, state.as_deref())
+                        .unwrap_or_else(|| "host pipeline creation refused".to_owned()),
+                )
+            } else {
+                Issue::missing(format!("shader translation failed: {}", failed.join(" + ")))
+            }
+        }
+    }
 }
 
 /// Host pipelines queued and not made yet.

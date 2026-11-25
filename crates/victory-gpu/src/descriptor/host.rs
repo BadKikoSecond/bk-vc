@@ -1340,6 +1340,16 @@ impl HostHeap {
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
     }
 
+    /// Whether a title view-heap slot is currently null. Dynamic slots and
+    /// sampler heaps have no title-view key, so they answer `None`.
+    pub(crate) fn slot_null(&self, index: u32) -> Option<bool> {
+        if self.sampler {
+            return None;
+        }
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.get(index as usize).map(|&key| key == 0)
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.

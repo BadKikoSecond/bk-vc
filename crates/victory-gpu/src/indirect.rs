@@ -221,21 +221,72 @@ fn min_stride(kind: u32) -> Option<u32> {
     }
 }
 
+/// Why an indirect argument range could not be made ready for execution.
+#[derive(Debug)]
+pub(crate) enum BoundIssue {
+    UnsupportedKind(u32),
+    Stride { kind: u32, stride: u32, minimum: u32 },
+    SourceOffset(u64),
+    CountOffset(u64),
+    Size,
+    Clamp,
+    Budget,
+    Scratch,
+    RecordAddress,
+}
+
+impl BoundIssue {
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::UnsupportedKind(kind) => format!("indirect layout: unsupported kind {kind}"),
+            Self::Stride { kind, stride, minimum } => format!(
+                "indirect layout: kind {kind} stride {stride} is below {minimum} or not 4-byte aligned"
+            ),
+            Self::SourceOffset(offset) => format!(
+                "indirect layout: argument offset {offset:#x} is not 4-byte aligned"
+            ),
+            Self::CountOffset(offset) => format!(
+                "indirect layout: count offset {offset:#x} is not 4-byte aligned"
+            ),
+            Self::Size => "indirect layout: stride times record count exceeds the scratch limit".to_owned(),
+            Self::Clamp => "argument clamp pipeline unavailable".to_owned(),
+            Self::Budget => "list indirect budget buffer unavailable".to_owned(),
+            Self::Scratch => "list indirect scratch allocation failed".to_owned(),
+            Self::RecordAddress => "indirect clamp layout or resource address alignment refused".to_owned(),
+        }
+    }
+}
+
 /// Validates record alignment and returns the scratch byte size `stride * records`.
 fn validate_layout(
     (kind, stride, records): (u32, u32, u32),
     src_offset: u64,
     count_offset: Option<u64>,
 ) -> Option<u64> {
-    let min = min_stride(kind)?;
-    if stride < min || !stride.is_multiple_of(4) || !src_offset.is_multiple_of(4) {
-        return None;
+    validate_layout_issue((kind, stride, records), src_offset, count_offset).ok()
+}
+
+fn validate_layout_issue(
+    (kind, stride, records): (u32, u32, u32),
+    src_offset: u64,
+    count_offset: Option<u64>,
+) -> Result<u64, BoundIssue> {
+    let Some(minimum) = min_stride(kind) else {
+        return Err(BoundIssue::UnsupportedKind(kind));
+    };
+    if stride < minimum || !stride.is_multiple_of(4) {
+        return Err(BoundIssue::Stride { kind, stride, minimum });
     }
-    if count_offset.is_some_and(|off| !off.is_multiple_of(4)) {
-        return None;
+    if !src_offset.is_multiple_of(4) {
+        return Err(BoundIssue::SourceOffset(src_offset));
     }
-    let bytes = u64::from(stride).checked_mul(u64::from(records))?;
-    (bytes <= u64::from(u32::MAX)).then_some(bytes)
+    if let Some(offset) = count_offset
+        && !offset.is_multiple_of(4)
+    {
+        return Err(BoundIssue::CountOffset(offset));
+    }
+    let bytes = u64::from(stride).checked_mul(u64::from(records)).ok_or(BoundIssue::Size)?;
+    (bytes <= u64::from(u32::MAX)).then_some(bytes).ok_or(BoundIssue::Size)
 }
 
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
@@ -244,35 +295,47 @@ fn validate_layout(
 /// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
 /// Replaces the list's compute root signature and pipeline (callers bind
 /// theirs after). `None` if the clamp or alignment is not available.
+#[cfg(test)]
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    bound_with_issue(list, src, count, spec).ok()
 }
 
-/// [`bound`] for a window of records clamped ahead of the draws that will
-/// read them (`crate::draw`'s windows; no count buffer). The records past
-/// the ones the title filled are whatever the buffer holds, and each
-/// record clamped charges the list's budget when it is clamped: a slot of
-/// all ones, clamped to the most a mesh dispatch runs (65,535 groups),
-/// charged a sixteenth of the budget, so sixteen of them emptied every
-/// draw of the list after them (run 93: "the largest group count asked for
-/// 4294967295", 43 to 153 such records a frame). Here a record that asks
-/// for more than can run is left empty and charges nothing; a record
-/// clamped alone is clamped and charged as before.
-pub(crate) fn bound_ahead(
+/// [`bound`] with the exact branch that refused the range.
+pub(crate) fn bound_with_issue(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+) -> Result<ID3D12Resource, BoundIssue> {
+    let bytes = validate_layout_issue(spec, src.1, count.map(|(_, offset)| offset))?;
+    let clamp = clamp().ok_or(BoundIssue::Clamp)?;
+    let budget = list.budget().ok_or(BoundIssue::Budget)?;
+    let dst = list.indirect_scratch(bytes).ok_or(BoundIssue::Scratch)?;
+    record_clamp(clamp, &list.list, &dst, budget, src, count, spec)
+        .then_some(dst)
+        .ok_or(BoundIssue::RecordAddress)
+}
+
+/// The windowed clamp used by `crate::draw` (no count buffer), with the
+/// exact branch that refused the range. Impossible or unfilled records are
+/// left empty and uncharged.
+pub(crate) fn bound_ahead_with_issue(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
-) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+) -> Result<ID3D12Resource, BoundIssue> {
+    let bytes = validate_layout_issue(spec, src.1, None)?;
+    let clamp = clamp().ok_or(BoundIssue::Clamp)?;
+    let budget = list.budget().ok_or(BoundIssue::Budget)?;
+    let dst = list.indirect_scratch(bytes).ok_or(BoundIssue::Scratch)?;
+    record_clamp_as(clamp, &list.list, &dst, budget, src, None, spec, true)
+        .then_some(dst)
+        .ok_or(BoundIssue::RecordAddress)
 }
 
 fn record_clamp(
@@ -288,7 +351,7 @@ fn record_clamp(
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
-/// their draws ([`bound_ahead`]).
+/// their draws ([`bound_ahead_with_issue`]).
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,

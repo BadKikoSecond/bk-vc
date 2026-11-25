@@ -5654,6 +5654,7 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        crate::frame_log::gfx_present(crate::frame::current(), crate::draw::drawn());
         crate::frame_log::present(crate::frame::current(), crate::draw::drawn());
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");

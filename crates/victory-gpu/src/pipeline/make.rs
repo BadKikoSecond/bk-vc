@@ -68,6 +68,12 @@ impl Pending {
     }
 }
 
+/// Whether a host pipeline has been made: `None` while a worker is making
+/// it, `Some(true)` when it is ready, `Some(false)` when it was refused.
+pub(crate) fn made(p: &Pending) -> Option<bool> {
+    p.made.get().map(|made| made.is_some())
+}
+
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
