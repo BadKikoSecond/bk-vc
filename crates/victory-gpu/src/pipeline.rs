@@ -367,6 +367,13 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+#[cfg(windows)]
+pub(crate) fn shader_hashes(this: This) -> String {
+    if this.is_null() { return "none".to_owned(); }
+    let hashes: Vec<&str> = pipeline(this).shaders.iter().map(|s| s.hash.as_str()).collect();
+    if hashes.is_empty() { "none".to_owned() } else { hashes.join(",") }
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {

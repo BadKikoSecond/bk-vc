@@ -24,6 +24,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+mod frame_log;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;

@@ -1669,12 +1669,14 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            self.frame_log("dispatch", Some("pipeline skipped"));
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            self.frame_log("dispatch", Some("builder disabled"));
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
@@ -1684,6 +1686,7 @@ impl State {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            self.frame_log("dispatch", Some("no host pipeline"));
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -1697,10 +1700,12 @@ impl State {
             return;
         };
         if !p.compute {
+            self.frame_log("dispatch", Some("graphics pipeline"));
             once!("a dispatch with a graphics pipeline");
             return;
         }
         if !self.bind(list, p, true) {
+            self.frame_log("dispatch", Some("bind failed"));
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -1713,6 +1718,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        self.frame_log("dispatch", None);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1823,6 +1829,16 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.frame_log("dispatch", if ran { None } else { Some("mesh disabled, prepare failed, or host interface unavailable") });
+    }
+
+    pub(crate) fn frame_log(&self, kind: &str, reason: Option<&str>) {
+        crate::frame_log::record(|| {
+            let hashes = crate::pipeline::shader_hashes(self.pipeline as This);
+            let targets: Vec<String> = self.targets.iter().filter(|&&t| t != 0).map(|t| format!("{t:#x}")).collect();
+            format!("kind={kind} shader={hashes} status={} reason={} targets={targets:?} depth={:#x}",
+                if reason.is_some() { "skipped" } else { "executed" }, reason.unwrap_or("none"), self.depth)
+        });
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -2151,6 +2167,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.frame_log("draw", if ran { None } else if !ready { Some("prepare failed") } else { Some("rectangle expansion failed") });
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
@@ -2252,6 +2269,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.frame_log("draw", if ran { None } else if lost { Some("indexed rectangles unsupported") } else { Some("prepare failed") });
     }
 }
 
@@ -2273,9 +2291,11 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
+            self.frame_log("indirect", Some("pipeline skipped"));
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            self.frame_log("indirect", Some("builder disabled"));
             return false;
         }
         const DRAW: u32 = 0;
@@ -2289,6 +2309,7 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            self.frame_log("indirect", Some("no host pipeline"));
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256
@@ -2319,11 +2340,13 @@ impl State {
                 "pipeline mismatch (compute {}, mesh {}, topology {})",
                 p.compute, p.mesh, self.topology
             ));
+            self.frame_log("indirect", Some("pipeline mismatch"));
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
+            self.frame_log("indirect", Some("arguments outside title buffers"));
             return false;
         };
         let counter = match count {
@@ -2331,6 +2354,7 @@ impl State {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
+                    self.frame_log("indirect", Some("count outside title buffers"));
                     return false;
                 }
             },
@@ -2341,10 +2365,12 @@ impl State {
             .flatten()
         else {
             why("no host signature");
+            self.frame_log("indirect", Some("no host signature"));
             return false;
         };
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
+            self.frame_log("indirect", Some("mesh disabled"));
             return false;
         }
         // A window of records clamped in one pass (`windows`): for single
@@ -2412,6 +2438,7 @@ impl State {
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    self.frame_log("indirect", Some("not bounded"));
                     return false;
                 };
                 self.host_pipeline = 0;
@@ -2437,6 +2464,7 @@ impl State {
         if !ran {
             crate::indirect::done(list, &bounded);
             why("prepare failed");
+            self.frame_log("indirect", Some("prepare failed"));
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -2462,6 +2490,7 @@ impl State {
             self.mesh_scissor(list, false);
         }
         crate::indirect::done(list, &bounded);
+        self.frame_log("indirect", None);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
