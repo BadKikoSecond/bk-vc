@@ -6046,9 +6046,7 @@ impl<'a> Lower<'a> {
                 });
                 if first == 0
                     && computed
-                    && let Some((lo, hi)) = self.view_address(site).or_else(|| {
-                        self.slot_address(site).ok().flatten()
-                    })
+                    && let Some((lo, hi)) = self.view_address(site)
                 {
                     words.extend([(0, lo), (1, hi)]);
                 }
