@@ -6553,8 +6553,10 @@ impl<'a> Lower<'a> {
 
     /// Whether a sampler phi is the small, direct constant range that can be
     /// selected with one static-sampler binding rather than branch dispatch.
+    /// Pixel stages keep the branch dispatch: their range index is per lane.
     fn is_sampler_range(&self, block: usize, args: &[Source]) -> bool {
-        (2..=3).contains(&args.len())
+        !self.s.pixel
+            && (2..=3).contains(&args.len())
             && self.x.p.blocks[block].preds.len() == args.len()
             && args
                 .iter()
