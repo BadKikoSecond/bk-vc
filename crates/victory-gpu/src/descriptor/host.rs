@@ -1521,13 +1521,25 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         _ => return None,
     };
     let desc = srv_desc(words);
-    let element = element_size(&desc);
-    // SAFETY: a buffer view's union member.
+    shader_range(base, &desc)
+}
+
+/// The title memory a buffer shader view reads. The description must name a
+/// buffer, and its element range must not wrap or be empty.
+fn shader_range(base: u64, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<(u64, u64)> {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    let element = element_size(desc);
+    if element == 0 {
+        return None;
+    }
+    // SAFETY: shader_range checked the view dimension.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    let address = base.checked_add(buffer.FirstElement.checked_mul(element)?)?;
+    let len = u64::from(buffer.NumElements).checked_mul(element)?;
+    address.checked_add(len)?;
+    (len != 0).then_some((address, len))
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -1587,7 +1599,10 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
-    // SAFETY: a buffer view's union member.
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: unordered_range checked the view dimension.
     let buffer = unsafe { desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
@@ -1596,10 +1611,13 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    if element == 0 {
+        return None;
+    }
+    let address = base.checked_add(buffer.FirstElement.checked_mul(element)?)?;
+    let len = u64::from(buffer.NumElements).checked_mul(element)?;
+    address.checked_add(len)?;
+    Some((address, len))
 }
 
 /// The host resource a slot made by [`make`] views, if any.
@@ -1669,6 +1687,9 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
     let shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
     // A structured view as a raw view of the same bytes (see `raw_window`).
@@ -1741,6 +1762,9 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
     let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
@@ -2316,6 +2340,80 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn placed_buffer(
+        unordered: bool,
+        dimension: u32,
+        format: u32,
+        first: u32,
+        count: u32,
+        stride: u32,
+        flags: u32,
+        base: u64,
+    ) -> View {
+        let mut desc = [0; 16];
+        (desc[0], desc[1]) = (format, dimension);
+        if unordered {
+            (desc[2], desc[3], desc[4], desc[5]) = (first, 0, count, stride);
+        } else {
+            desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            (desc[4], desc[5], desc[6], desc[7]) = (first, 0, count, stride);
+        }
+        desc[8] = flags;
+        (desc[10], desc[11]) = (base as u32, (base >> 32) as u32);
+        View::Placed(unordered, [1, 0, 0, 0, 0x1000, 0, 0, 0, 0, 0, 0, 0, 0, 0], desc)
+    }
+
+    #[test]
+    fn buffer_range_rejects_texture_srv_dimension() {
+        let view = placed_buffer(false, D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32, 28, 0, 1, 0, 0, 0x1000);
+        assert!(buffer_range(&view).is_none());
+    }
+
+    #[test]
+    fn buffer_range_rejects_texture_uav_dimension() {
+        let view = placed_buffer(true, D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32, 28, 0, 1, 0, 0, 0x1000);
+        assert!(buffer_range(&view).is_none());
+    }
+
+    #[test]
+    fn buffer_range_rejects_first_element_overflow() {
+        let view = placed_buffer(false, D3D12_SRV_DIMENSION_BUFFER.0 as u32, 28, 1, 1, 0, 0, u64::MAX - 3);
+        assert!(buffer_range(&view).is_none());
+    }
+
+    #[test]
+    fn buffer_range_rejects_zero_length_srv() {
+        let view = placed_buffer(false, D3D12_SRV_DIMENSION_BUFFER.0 as u32, 28, 0, 0, 0, 0, 0x1000);
+        assert!(buffer_range(&view).is_none());
+    }
+
+    #[test]
+    fn buffer_range_rejects_an_unknown_element_size() {
+        let view = placed_buffer(false, D3D12_SRV_DIMENSION_BUFFER.0 as u32, 0, 0, 1, 0, 0, 0x1000);
+        assert!(buffer_range(&view).is_none());
+    }
+
+    #[test]
+    fn buffer_copy_rejects_zero_length_uav() {
+        let view = placed_buffer(true, D3D12_UAV_DIMENSION_BUFFER.0 as u32, 28, 0, 0, 0, 0, 0x1000);
+        assert!(buffer_copy(&view).is_none());
+    }
+
+    #[test]
+    fn buffer_ranges_keep_checked_element_offsets() {
+        let srv = placed_buffer(false, D3D12_SRV_DIMENSION_BUFFER.0 as u32, 28, 2, 3, 0, 0, 0x1000);
+        let View::Placed(_, _, words) = &srv else { unreachable!() };
+        let desc = srv_desc(&words[..10].try_into().unwrap());
+        assert_eq!(desc.ViewDimension, D3D12_SRV_DIMENSION_BUFFER);
+        // SAFETY: the dimension was checked above.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        assert_eq!((buffer.FirstElement, buffer.NumElements), (2, 3));
+        assert_eq!(shader_range(0x1000, &desc), Some((0x1008, 12)));
+        assert_eq!(buffer_range(&srv), Some((0x1008, 12)));
+        let uav = placed_buffer(true, D3D12_UAV_DIMENSION_BUFFER.0 as u32, 0, 1, 2, 16, 0, 0x1000);
+        assert_eq!(buffer_range(&uav), Some((0x1010, 32)));
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
