@@ -390,6 +390,34 @@ impl Shader {
         self.annotate(block, h, 14 | cmp, 0)
     }
 
+    /// A handle to the static samplers at `lo..=hi` picked by `index`.
+    /// D3D12 allows the register range of a static-sampler binding to be indexed.
+    pub fn sampler_range_handle(&mut self, block: usize, lo: u32, hi: u32, index: V) -> V {
+        let bind = [
+            self.m.i32(lo),
+            self.m.i32(hi),
+            self.m.i32(SAMPLER_SPACE),
+            self.m.i8(3), // sampler
+        ];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, index, f],
+        );
+        let mut cmp = 0;
+        for n in lo..=hi {
+            if n < 64 && self.cmp_samplers >> n & 1 != 0 {
+                cmp = 0x8000;
+            }
+        }
+        self.annotate(block, h, 14 | cmp, 0)
+    }
+
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
